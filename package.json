@@ -1,6 +1,6 @@
 {
   "name": "quickswap",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Fast LAN screen sharing with remote control",
   "main": "dist-electron/main.js",
   "author": "QuickSwap Software",
