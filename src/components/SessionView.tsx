@@ -32,6 +32,7 @@ export default function SessionView({
   onInputEvent,
 }: SessionViewProps) {
   const [isFullscreen, setIsFullscreen] = useState(false)
+  const [fps, setFps] = useState(0)
 
   const toggleFullscreen = useCallback(() => {
     if (!document.fullscreenElement) {
@@ -49,14 +50,16 @@ export default function SessionView({
         stream={stream}
         isControlling={isControlling}
         onInputEvent={onInputEvent}
+        onFpsUpdate={setFps}
       />
-      <ConnectionOverlay pc={pc} stream={stream} />
+      <ConnectionOverlay pc={pc} fps={fps} />
       <ControlBar
         stream={stream}
         pc={pc}
         peerName={peerName}
         isControlling={isControlling}
         gameMode={gameMode}
+        fps={fps}
         onDisconnect={onDisconnect}
         onSwap={onSwap}
         onRequestControl={onRequestControl}

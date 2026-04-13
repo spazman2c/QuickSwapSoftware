@@ -2,22 +2,16 @@ import { screen } from 'electron'
 import { spawn, ChildProcess } from 'node:child_process'
 import { InputEventData } from './protocol'
 
-/**
- * Persistent input controller that uses long-lived subprocesses
- * instead of spawning a new process per event.
- *
- * macOS:  persistent Python process reading JSON commands from stdin
- * Windows: persistent PowerShell process reading JSON commands from stdin
- */
 export class InputController {
   private enabled = false
   private platform = process.platform
   private subprocess: ChildProcess | null = null
   private ready = false
+  private queue: string[] = []
 
   enable(): void {
     this.enabled = true
-    this.ensureSubprocess()
+    this.spawnIfNeeded()
   }
 
   disable(): void {
@@ -26,9 +20,10 @@ export class InputController {
 
   destroy(): void {
     this.enabled = false
+    this.queue = []
     if (this.subprocess) {
-      this.subprocess.stdin?.end()
-      this.subprocess.kill()
+      try { this.subprocess.stdin?.end() } catch {}
+      try { this.subprocess.kill() } catch {}
       this.subprocess = null
       this.ready = false
     }
@@ -47,12 +42,13 @@ export class InputController {
         this.sendWindowsCommand(event, width, height)
       }
     } catch {
-      // Silently ignore simulation errors to not break the stream
+      // Silently ignore to not break the stream
     }
   }
 
-  private ensureSubprocess(): void {
-    if (this.subprocess && this.ready) return
+  private spawnIfNeeded(): void {
+    // Already running or starting — don't respawn
+    if (this.subprocess) return
 
     if (this.platform === 'darwin') {
       this.spawnMacHelper()
@@ -61,14 +57,30 @@ export class InputController {
     }
   }
 
-  // ── macOS: persistent Python + Quartz process ──────────────────
+  private flushQueue(): void {
+    if (!this.subprocess?.stdin?.writable) return
+    for (const line of this.queue) {
+      this.subprocess.stdin.write(line)
+    }
+    this.queue = []
+  }
+
+  private send(json: Record<string, any>): void {
+    const line = JSON.stringify(json) + '\n'
+
+    if (this.ready && this.subprocess?.stdin?.writable) {
+      this.subprocess.stdin.write(line)
+    } else {
+      // Buffer until ready (only keep last ~20 to avoid flooding)
+      if (this.queue.length > 20) this.queue.shift()
+      this.queue.push(line)
+      this.spawnIfNeeded()
+    }
+  }
+
+  // ── macOS: persistent Python + Quartz ────────────────────────
 
   private spawnMacHelper(): void {
-    if (this.subprocess) {
-      this.subprocess.kill()
-      this.subprocess = null
-    }
-
     const script = `
 import sys, json, Quartz
 
@@ -117,70 +129,64 @@ for line in sys.stdin:
         pass
 `
 
-    this.subprocess = spawn('python3', ['-u', '-c', script], {
-      stdio: ['pipe', 'pipe', 'ignore'],
+    // Use /usr/bin/python3 to guarantee Apple's system Python with PyObjC Quartz
+    const pythonPath = '/usr/bin/python3'
+
+    this.subprocess = spawn(pythonPath, ['-u', '-c', script], {
+      stdio: ['pipe', 'pipe', 'pipe'],
     })
 
     this.subprocess.stdout?.once('data', () => {
       this.ready = true
+      this.flushQueue()
     })
 
-    this.subprocess.on('exit', () => {
+    this.subprocess.stderr?.on('data', (data: Buffer) => {
+      console.error('[input-controller] python stderr:', data.toString().trim())
+    })
+
+    this.subprocess.on('error', (err: Error) => {
+      console.error('[input-controller] spawn error:', err.message)
       this.subprocess = null
       this.ready = false
-      // Respawn if still enabled
+    })
+
+    this.subprocess.on('exit', (code: number | null) => {
+      console.log('[input-controller] python exited with code', code)
+      this.subprocess = null
+      this.ready = false
+      // Respawn after a delay if still enabled
       if (this.enabled) {
-        setTimeout(() => this.ensureSubprocess(), 100)
+        setTimeout(() => this.spawnIfNeeded(), 500)
       }
     })
   }
 
   private sendMacCommand(event: InputEventData, width: number, height: number): void {
-    this.ensureSubprocess()
-    if (!this.subprocess?.stdin?.writable) return
-
     let cmd: Record<string, any> | null = null
 
     switch (event.type) {
       case 'mouse-move': {
         if (event.x != null && event.y != null) {
-          cmd = {
-            type: 'mouse-move',
-            x: Math.round(event.x * width),
-            y: Math.round(event.y * height),
-          }
+          cmd = { type: 'mouse-move', x: Math.round(event.x * width), y: Math.round(event.y * height) }
         }
         break
       }
       case 'mouse-down': {
         if (event.x != null && event.y != null) {
-          cmd = {
-            type: 'mouse-down',
-            x: Math.round(event.x * width),
-            y: Math.round(event.y * height),
-            button: event.button || 'left',
-          }
+          cmd = { type: 'mouse-down', x: Math.round(event.x * width), y: Math.round(event.y * height), button: event.button || 'left' }
         }
         break
       }
       case 'mouse-up': {
         if (event.x != null && event.y != null) {
-          cmd = {
-            type: 'mouse-up',
-            x: Math.round(event.x * width),
-            y: Math.round(event.y * height),
-            button: event.button || 'left',
-          }
+          cmd = { type: 'mouse-up', x: Math.round(event.x * width), y: Math.round(event.y * height), button: event.button || 'left' }
         }
         break
       }
       case 'mouse-scroll': {
         if (event.deltaY != null) {
-          cmd = {
-            type: 'mouse-scroll',
-            deltaY: Math.round(-event.deltaY / 3),
-            deltaX: event.deltaX != null ? Math.round(-event.deltaX / 3) : 0,
-          }
+          cmd = { type: 'mouse-scroll', deltaY: Math.round(-event.deltaY / 3), deltaX: event.deltaX != null ? Math.round(-event.deltaX / 3) : 0 }
         }
         break
       }
@@ -189,30 +195,19 @@ for line in sys.stdin:
         if (event.code) {
           const keyCode = this.macKeyCode(event.code)
           if (keyCode !== -1) {
-            cmd = {
-              type: event.type,
-              keyCode,
-              flags: this.macModifierFlagValue(event.modifiers),
-            }
+            cmd = { type: event.type, keyCode, flags: this.macModifierFlagValue(event.modifiers) }
           }
         }
         break
       }
     }
 
-    if (cmd) {
-      this.subprocess.stdin!.write(JSON.stringify(cmd) + '\n')
-    }
+    if (cmd) this.send(cmd)
   }
 
-  // ── Windows: persistent PowerShell process ─────────────────────
+  // ── Windows: persistent PowerShell ───────────────────────────
 
   private spawnWindowsHelper(): void {
-    if (this.subprocess) {
-      this.subprocess.kill()
-      this.subprocess = null
-    }
-
     const script = `
 Add-Type -TypeDefinition @"
 using System;
@@ -254,70 +249,56 @@ while ($true) {
 `
 
     this.subprocess = spawn('powershell', ['-NoProfile', '-NoLogo', '-Command', '-'], {
-      stdio: ['pipe', 'pipe', 'ignore'],
+      stdio: ['pipe', 'pipe', 'pipe'],
     })
 
-    // Feed the script through stdin, then keep stdin open for commands
     this.subprocess.stdout?.once('data', () => {
       this.ready = true
+      this.flushQueue()
     })
 
     this.subprocess.stdin?.write(script + '\n')
+
+    this.subprocess.on('error', (err: Error) => {
+      console.error('[input-controller] powershell error:', err.message)
+      this.subprocess = null
+      this.ready = false
+    })
 
     this.subprocess.on('exit', () => {
       this.subprocess = null
       this.ready = false
       if (this.enabled) {
-        setTimeout(() => this.ensureSubprocess(), 100)
+        setTimeout(() => this.spawnIfNeeded(), 500)
       }
     })
   }
 
   private sendWindowsCommand(event: InputEventData, width: number, height: number): void {
-    this.ensureSubprocess()
-    if (!this.subprocess?.stdin?.writable) return
-
     let cmd: Record<string, any> | null = null
 
     switch (event.type) {
       case 'mouse-move': {
         if (event.x != null && event.y != null) {
-          cmd = {
-            type: 'mouse-move',
-            x: Math.round(event.x * width),
-            y: Math.round(event.y * height),
-          }
+          cmd = { type: 'mouse-move', x: Math.round(event.x * width), y: Math.round(event.y * height) }
         }
         break
       }
       case 'mouse-down': {
         if (event.x != null && event.y != null) {
-          cmd = {
-            type: 'mouse-down',
-            x: Math.round(event.x * width),
-            y: Math.round(event.y * height),
-            button: event.button || 'left',
-          }
+          cmd = { type: 'mouse-down', x: Math.round(event.x * width), y: Math.round(event.y * height), button: event.button || 'left' }
         }
         break
       }
       case 'mouse-up': {
         if (event.x != null && event.y != null) {
-          cmd = {
-            type: 'mouse-up',
-            x: Math.round(event.x * width),
-            y: Math.round(event.y * height),
-            button: event.button || 'left',
-          }
+          cmd = { type: 'mouse-up', x: Math.round(event.x * width), y: Math.round(event.y * height), button: event.button || 'left' }
         }
         break
       }
       case 'mouse-scroll': {
         if (event.deltaY != null) {
-          cmd = {
-            type: 'mouse-scroll',
-            deltaY: Math.round(-event.deltaY),
-          }
+          cmd = { type: 'mouse-scroll', deltaY: Math.round(-event.deltaY) }
         }
         break
       }
@@ -326,32 +307,21 @@ while ($true) {
         if (event.code) {
           const vk = this.windowsVK(event.code)
           if (vk) {
-            cmd = {
-              type: event.type,
-              vk: parseInt(vk, 16),
-            }
+            cmd = { type: event.type, vk: parseInt(vk, 16) }
           }
         }
         break
       }
     }
 
-    if (cmd) {
-      // Send as JSON line to the running PowerShell stdin
-      // The PowerShell script's while loop will pick it up
-      // But we need to feed it as a variable assignment + processing
-      // Actually the PowerShell approach above reads from Console.In in a loop
-      // We need to write the JSON line to stdin
-      this.subprocess.stdin!.write(JSON.stringify(cmd) + '\n')
-    }
+    if (cmd) this.send(cmd)
   }
 
-  // ── Key code mappings ──────────────────────────────────────────
+  // ── Key code mappings ────────────────────────────────────────
 
   private macModifierFlagValue(mods?: InputEventData['modifiers']): number {
     if (!mods) return 0
     let flags = 0
-    // Quartz modifier flag values
     if (mods.shift) flags |= 0x20000   // kCGEventFlagMaskShift
     if (mods.ctrl) flags |= 0x40000    // kCGEventFlagMaskControl
     if (mods.alt) flags |= 0x80000     // kCGEventFlagMaskAlternate

@@ -308,10 +308,10 @@ export default function App() {
         const params = sender.getParameters()
         if (params.encodings && params.encodings.length > 0) {
           if (newGameMode) {
-            // Game mode: lower resolution (scale down by 1.5x), max bitrate, prioritize framerate
+            // Game mode: halve resolution, lower bitrate, max framerate
             params.encodings[0].maxFramerate = 60
-            params.encodings[0].maxBitrate = 30_000_000
-            params.encodings[0].scaleResolutionDownBy = 1.5
+            params.encodings[0].maxBitrate = 20_000_000
+            params.encodings[0].scaleResolutionDownBy = 2.0
           } else {
             // Normal mode: full resolution, high bitrate
             params.encodings[0].maxFramerate = 60

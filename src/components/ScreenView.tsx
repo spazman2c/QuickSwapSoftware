@@ -5,15 +5,49 @@ interface ScreenViewProps {
   stream: MediaStream
   isControlling: boolean
   onInputEvent: (event: InputEvent) => void
+  onFpsUpdate?: (fps: number) => void
 }
 
-export default function ScreenView({ stream, isControlling, onInputEvent }: ScreenViewProps) {
+export default function ScreenView({ stream, isControlling, onInputEvent, onFpsUpdate }: ScreenViewProps) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
+  const frameCountRef = useRef(0)
+  const onFpsUpdateRef = useRef(onFpsUpdate)
+  onFpsUpdateRef.current = onFpsUpdate
 
   useEffect(() => {
     if (videoRef.current && stream) {
       videoRef.current.srcObject = stream
+    }
+  }, [stream])
+
+  // Accurate FPS counting using requestVideoFrameCallback on the real video element
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video) return
+
+    frameCountRef.current = 0
+    let cancelled = false
+
+    // Count actual rendered video frames
+    if ('requestVideoFrameCallback' in video) {
+      const countFrame = () => {
+        if (cancelled) return
+        frameCountRef.current++
+        ;(video as any).requestVideoFrameCallback(countFrame)
+      }
+      ;(video as any).requestVideoFrameCallback(countFrame)
+    }
+
+    // Report FPS every second
+    const interval = setInterval(() => {
+      onFpsUpdateRef.current?.(frameCountRef.current)
+      frameCountRef.current = 0
+    }, 1000)
+
+    return () => {
+      cancelled = true
+      clearInterval(interval)
     }
   }, [stream])
 
@@ -24,7 +58,6 @@ export default function ScreenView({ stream, isControlling, onInputEvent }: Scre
       const video = videoRef.current
       const rect = video.getBoundingClientRect()
 
-      // Account for object-fit: contain — the video might not fill the entire element
       const videoAspect = video.videoWidth / video.videoHeight
       const elementAspect = rect.width / rect.height
 
@@ -32,12 +65,10 @@ export default function ScreenView({ stream, isControlling, onInputEvent }: Scre
       let offsetX = 0, offsetY = 0
 
       if (videoAspect > elementAspect) {
-        // Video is wider — letterboxed top/bottom
         renderWidth = rect.width
         renderHeight = rect.width / videoAspect
         offsetY = (rect.height - renderHeight) / 2
       } else {
-        // Video is taller — pillarboxed left/right
         renderHeight = rect.height
         renderWidth = rect.height * videoAspect
         offsetX = (rect.width - renderWidth) / 2
@@ -83,8 +114,7 @@ export default function ScreenView({ stream, isControlling, onInputEvent }: Scre
       const { x, y } = getNormalizedCoords(e)
       onInputEvent({
         type: 'mouse-down',
-        x,
-        y,
+        x, y,
         button: getButtonName(e.button),
         modifiers: getModifiers(e),
       })
@@ -98,8 +128,7 @@ export default function ScreenView({ stream, isControlling, onInputEvent }: Scre
       const { x, y } = getNormalizedCoords(e)
       onInputEvent({
         type: 'mouse-up',
-        x,
-        y,
+        x, y,
         button: getButtonName(e.button),
         modifiers: getModifiers(e),
       })
@@ -176,7 +205,6 @@ export default function ScreenView({ stream, isControlling, onInputEvent }: Scre
         disablePictureInPicture
       />
 
-      {/* Control mode indicator */}
       {isControlling && (
         <div className="absolute top-3 left-1/2 -translate-x-1/2 px-3 py-1 rounded-full bg-accent/20 border border-accent/30 text-accent text-xs font-medium backdrop-blur-xl">
           Remote control active
