@@ -150,6 +150,7 @@ ipcMain.handle('end-session', async () => {
   signalingServer?.stop()
   signalingClient?.disconnect()
   inputController?.disable()
+  inputController?.destroy()
   discovery = null
   signalingServer = null
   signalingClient = null
@@ -211,6 +212,7 @@ app.on('window-all-closed', () => {
   discovery?.stop()
   signalingServer?.stop()
   signalingClient?.disconnect()
+  inputController?.destroy()
   app.quit()
 })
 

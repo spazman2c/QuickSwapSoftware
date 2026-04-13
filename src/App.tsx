@@ -19,6 +19,7 @@ export default function App() {
   const dataChannelRef = useRef<RTCDataChannel | null>(null)
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null)
   const [isControlling, setIsControlling] = useState(false)
+  const [gameMode, setGameMode] = useState(false)
   const swappingRef = useRef(false)
 
   useEffect(() => {
@@ -107,6 +108,8 @@ export default function App() {
           dataChannelRef.current?.send(JSON.stringify({ type: 'control-grant' }))
         } else if (msg.type === 'control-grant') {
           setIsControlling(true)
+        } else if (msg.type === 'game-mode') {
+          setGameMode(msg.enabled)
         }
       } catch {}
     }
@@ -173,6 +176,8 @@ export default function App() {
         }
         params.encodings[0].maxFramerate = 60
         params.encodings[0].maxBitrate = 50_000_000
+        params.encodings[0].networkPriority = 'high'
+        params.encodings[0].priority = 'high'
         // Disable bandwidth probing delays — we're on LAN
         params.degradationPreference = 'maintain-framerate'
         await sender.setParameters(params)
@@ -292,6 +297,43 @@ export default function App() {
     dataChannelRef.current?.send(JSON.stringify({ type: 'control-request' }))
   }, [])
 
+  const toggleGameMode = useCallback(async () => {
+    const newGameMode = !gameMode
+    setGameMode(newGameMode)
+
+    // Adjust encoding parameters on the active sender
+    const sender = pcRef.current?.getSenders().find((s) => s.track?.kind === 'video')
+    if (sender) {
+      try {
+        const params = sender.getParameters()
+        if (params.encodings && params.encodings.length > 0) {
+          if (newGameMode) {
+            // Game mode: lower resolution (scale down by 1.5x), max bitrate, prioritize framerate
+            params.encodings[0].maxFramerate = 60
+            params.encodings[0].maxBitrate = 30_000_000
+            params.encodings[0].scaleResolutionDownBy = 1.5
+          } else {
+            // Normal mode: full resolution, high bitrate
+            params.encodings[0].maxFramerate = 60
+            params.encodings[0].maxBitrate = 50_000_000
+            params.encodings[0].scaleResolutionDownBy = 1.0
+          }
+          params.degradationPreference = 'maintain-framerate'
+          await sender.setParameters(params)
+        }
+      } catch {
+        // Sender may not be ready
+      }
+    }
+
+    // Also notify the peer about game mode via data channel
+    if (dataChannelRef.current?.readyState === 'open') {
+      dataChannelRef.current.send(
+        JSON.stringify({ type: 'game-mode', enabled: newGameMode })
+      )
+    }
+  }, [gameMode])
+
   const handleDisconnect = useCallback(() => {
     localStreamRef.current?.getTracks().forEach((t) => t.stop())
     remoteStreamRef.current = null
@@ -305,6 +347,7 @@ export default function App() {
     setRemoteStream(null)
     setPeerConnected(false)
     setIsControlling(false)
+    setGameMode(false)
     window.quickswap.endSession()
     window.quickswap.disableInput()
     window.quickswap.resizeWindow(420, 580)
@@ -369,12 +412,15 @@ export default function App() {
         {view === 'session' && remoteStream && (
           <SessionView
             stream={remoteStream}
+            pc={pcRef.current}
             role={role}
             peerName={peerName}
             isControlling={isControlling}
+            gameMode={gameMode}
             onDisconnect={handleDisconnect}
             onSwap={requestSwap}
             onRequestControl={requestControl}
+            onToggleGameMode={toggleGameMode}
             onInputEvent={sendInputEvent}
           />
         )}

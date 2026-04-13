@@ -3,23 +3,29 @@ import StatusIndicator from './StatusIndicator'
 
 interface ControlBarProps {
   stream: MediaStream | null
+  pc: RTCPeerConnection | null
   peerName: string
   isControlling: boolean
+  gameMode: boolean
   onDisconnect: () => void
   onSwap: () => void
   onRequestControl: () => void
   onToggleFullscreen: () => void
+  onToggleGameMode: () => void
   isFullscreen: boolean
 }
 
 export default function ControlBar({
   stream,
+  pc,
   peerName,
   isControlling,
+  gameMode,
   onDisconnect,
   onSwap,
   onRequestControl,
   onToggleFullscreen,
+  onToggleGameMode,
   isFullscreen,
 }: ControlBarProps) {
   const [visible, setVisible] = useState(true)
@@ -67,7 +73,7 @@ export default function ControlBar({
       }}
     >
       {/* Status */}
-      <StatusIndicator stream={stream} />
+      <StatusIndicator stream={stream} pc={pc} />
 
       <div className="w-px h-5 bg-white/[0.08]" />
 
@@ -93,6 +99,28 @@ export default function ControlBar({
         title={isControlling ? 'Currently controlling' : 'Request control'}
       >
         {isControlling ? 'Controlling' : 'Request Control'}
+      </button>
+
+      {/* Game Mode */}
+      <button
+        onClick={onToggleGameMode}
+        className={`
+          titlebar-no-drag
+          p-1.5 rounded-lg
+          transition-all duration-200
+          ${gameMode
+            ? 'bg-accent/15 text-accent border border-accent/25'
+            : 'bg-white/[0.06] border border-white/[0.08] text-text-secondary hover:text-text-primary hover:bg-white/[0.1]'
+          }
+        `}
+        title={gameMode ? 'Game mode on — prioritizing FPS' : 'Enable game mode'}
+      >
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M6 12h4m-2-2v4" />
+          <circle cx="17" cy="10" r="1" fill="currentColor" />
+          <circle cx="15" cy="14" r="1" fill="currentColor" />
+          <rect x="2" y="6" width="20" height="12" rx="3" />
+        </svg>
       </button>
 
       {/* Swap */}

@@ -1,17 +1,37 @@
 import { screen } from 'electron'
-import { execFile } from 'node:child_process'
+import { spawn, ChildProcess } from 'node:child_process'
 import { InputEventData } from './protocol'
 
+/**
+ * Persistent input controller that uses long-lived subprocesses
+ * instead of spawning a new process per event.
+ *
+ * macOS:  persistent Python process reading JSON commands from stdin
+ * Windows: persistent PowerShell process reading JSON commands from stdin
+ */
 export class InputController {
   private enabled = false
   private platform = process.platform
+  private subprocess: ChildProcess | null = null
+  private ready = false
 
   enable(): void {
     this.enabled = true
+    this.ensureSubprocess()
   }
 
   disable(): void {
     this.enabled = false
+  }
+
+  destroy(): void {
+    this.enabled = false
+    if (this.subprocess) {
+      this.subprocess.stdin?.end()
+      this.subprocess.kill()
+      this.subprocess = null
+      this.ready = false
+    }
   }
 
   simulateInput(event: InputEventData): void {
@@ -19,159 +39,285 @@ export class InputController {
 
     const display = screen.getPrimaryDisplay()
     const { width, height } = display.size
-    const scale = display.scaleFactor
 
     try {
       if (this.platform === 'darwin') {
-        this.simulateMac(event, width, height, scale)
+        this.sendMacCommand(event, width, height)
       } else if (this.platform === 'win32') {
-        this.simulateWindows(event, width, height)
+        this.sendWindowsCommand(event, width, height)
       }
-    } catch (err) {
+    } catch {
       // Silently ignore simulation errors to not break the stream
     }
   }
 
-  private simulateMac(event: InputEventData, width: number, height: number, _scale: number): void {
+  private ensureSubprocess(): void {
+    if (this.subprocess && this.ready) return
+
+    if (this.platform === 'darwin') {
+      this.spawnMacHelper()
+    } else if (this.platform === 'win32') {
+      this.spawnWindowsHelper()
+    }
+  }
+
+  // ── macOS: persistent Python + Quartz process ──────────────────
+
+  private spawnMacHelper(): void {
+    if (this.subprocess) {
+      this.subprocess.kill()
+      this.subprocess = null
+    }
+
+    const script = `
+import sys, json, Quartz
+
+def handle(cmd):
+    t = cmd['type']
+    if t == 'mouse-move':
+        e = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventMouseMoved, (cmd['x'], cmd['y']), Quartz.kCGMouseButtonLeft)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, e)
+    elif t == 'mouse-down':
+        right = cmd.get('button') == 'right'
+        et = Quartz.kCGEventRightMouseDown if right else Quartz.kCGEventLeftMouseDown
+        btn = Quartz.kCGMouseButtonRight if right else Quartz.kCGMouseButtonLeft
+        e = Quartz.CGEventCreateMouseEvent(None, et, (cmd['x'], cmd['y']), btn)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, e)
+    elif t == 'mouse-up':
+        right = cmd.get('button') == 'right'
+        et = Quartz.kCGEventRightMouseUp if right else Quartz.kCGEventLeftMouseUp
+        btn = Quartz.kCGMouseButtonRight if right else Quartz.kCGMouseButtonLeft
+        e = Quartz.CGEventCreateMouseEvent(None, et, (cmd['x'], cmd['y']), btn)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, e)
+    elif t == 'mouse-scroll':
+        dy = cmd.get('deltaY', 0)
+        dx = cmd.get('deltaX', 0)
+        e = Quartz.CGEventCreateScrollWheelEvent(None, Quartz.kCGScrollEventUnitPixel, 2, dy, dx)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, e)
+    elif t in ('key-down', 'key-up'):
+        down = t == 'key-down'
+        kc = cmd.get('keyCode', -1)
+        if kc >= 0:
+            e = Quartz.CGEventCreateKeyboardEvent(None, kc, down)
+            flags = cmd.get('flags', 0)
+            if flags:
+                e.setFlags(flags)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, e)
+
+sys.stdout.write('ready\\n')
+sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        cmd = json.loads(line)
+        handle(cmd)
+    except Exception:
+        pass
+`
+
+    this.subprocess = spawn('python3', ['-u', '-c', script], {
+      stdio: ['pipe', 'pipe', 'ignore'],
+    })
+
+    this.subprocess.stdout?.once('data', () => {
+      this.ready = true
+    })
+
+    this.subprocess.on('exit', () => {
+      this.subprocess = null
+      this.ready = false
+      // Respawn if still enabled
+      if (this.enabled) {
+        setTimeout(() => this.ensureSubprocess(), 100)
+      }
+    })
+  }
+
+  private sendMacCommand(event: InputEventData, width: number, height: number): void {
+    this.ensureSubprocess()
+    if (!this.subprocess?.stdin?.writable) return
+
+    let cmd: Record<string, any> | null = null
+
     switch (event.type) {
       case 'mouse-move': {
         if (event.x != null && event.y != null) {
-          const x = Math.round(event.x * width)
-          const y = Math.round(event.y * height)
-          this.runAppleScript(`
-            tell application "System Events"
-              set position of mouse to {${x}, ${y}}
-            end tell
-          `)
-          // Fallback: use CGEvent via python for mouse move (more reliable)
-          this.runPython(`
-import Quartz
-e = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventMouseMoved, (${x}, ${y}), Quartz.kCGMouseButtonLeft)
-Quartz.CGEventPost(Quartz.kCGHIDEventTap, e)
-`)
+          cmd = {
+            type: 'mouse-move',
+            x: Math.round(event.x * width),
+            y: Math.round(event.y * height),
+          }
         }
         break
       }
       case 'mouse-down': {
         if (event.x != null && event.y != null) {
-          const x = Math.round(event.x * width)
-          const y = Math.round(event.y * height)
-          const isRight = event.button === 'right'
-          const eventType = isRight ? 'Quartz.kCGEventRightMouseDown' : 'Quartz.kCGEventLeftMouseDown'
-          const button = isRight ? 'Quartz.kCGMouseButtonRight' : 'Quartz.kCGMouseButtonLeft'
-          this.runPython(`
-import Quartz
-e = Quartz.CGEventCreateMouseEvent(None, ${eventType}, (${x}, ${y}), ${button})
-Quartz.CGEventPost(Quartz.kCGHIDEventTap, e)
-`)
+          cmd = {
+            type: 'mouse-down',
+            x: Math.round(event.x * width),
+            y: Math.round(event.y * height),
+            button: event.button || 'left',
+          }
         }
         break
       }
       case 'mouse-up': {
         if (event.x != null && event.y != null) {
-          const x = Math.round(event.x * width)
-          const y = Math.round(event.y * height)
-          const isRight = event.button === 'right'
-          const eventType = isRight ? 'Quartz.kCGEventRightMouseUp' : 'Quartz.kCGEventLeftMouseUp'
-          const button = isRight ? 'Quartz.kCGMouseButtonRight' : 'Quartz.kCGMouseButtonLeft'
-          this.runPython(`
-import Quartz
-e = Quartz.CGEventCreateMouseEvent(None, ${eventType}, (${x}, ${y}), ${button})
-Quartz.CGEventPost(Quartz.kCGHIDEventTap, e)
-`)
+          cmd = {
+            type: 'mouse-up',
+            x: Math.round(event.x * width),
+            y: Math.round(event.y * height),
+            button: event.button || 'left',
+          }
         }
         break
       }
       case 'mouse-scroll': {
         if (event.deltaY != null) {
-          // CGEvent scroll: positive = up, negative = down (opposite of browser)
-          const delta = Math.round(-event.deltaY / 3)
-          const deltaX = event.deltaX != null ? Math.round(-event.deltaX / 3) : 0
-          this.runPython(`
-import Quartz
-e = Quartz.CGEventCreateScrollWheelEvent(None, Quartz.kCGScrollEventUnitPixel, 2, ${delta}, ${deltaX})
-Quartz.CGEventPost(Quartz.kCGHIDEventTap, e)
-`)
+          cmd = {
+            type: 'mouse-scroll',
+            deltaY: Math.round(-event.deltaY / 3),
+            deltaX: event.deltaX != null ? Math.round(-event.deltaX / 3) : 0,
+          }
         }
         break
       }
       case 'key-down':
       case 'key-up': {
         if (event.code) {
-          const down = event.type === 'key-down'
           const keyCode = this.macKeyCode(event.code)
           if (keyCode !== -1) {
-            const flags = this.macModifierFlags(event.modifiers)
-            this.runPython(`
-import Quartz
-e = Quartz.CGEventCreateKeyboardEvent(None, ${keyCode}, ${down ? 'True' : 'False'})
-${flags ? `e.setFlags(${flags})` : ''}
-Quartz.CGEventPost(Quartz.kCGHIDEventTap, e)
-`)
+            cmd = {
+              type: event.type,
+              keyCode,
+              flags: this.macModifierFlagValue(event.modifiers),
+            }
           }
         }
         break
       }
     }
+
+    if (cmd) {
+      this.subprocess.stdin!.write(JSON.stringify(cmd) + '\n')
+    }
   }
 
-  private simulateWindows(event: InputEventData, width: number, height: number): void {
+  // ── Windows: persistent PowerShell process ─────────────────────
+
+  private spawnWindowsHelper(): void {
+    if (this.subprocess) {
+      this.subprocess.kill()
+      this.subprocess = null
+    }
+
+    const script = `
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class NativeInput {
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, int dx, int dy, int dwData, IntPtr dwExtraInfo);
+    [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, IntPtr dwExtraInfo);
+}
+"@
+Add-Type -AssemblyName System.Web.Extensions
+$ser = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+Write-Host "ready"
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($line -eq $null) { break }
+    if ($line.Trim() -eq "") { continue }
+    try {
+        $cmd = $ser.DeserializeObject($line)
+        $t = $cmd["type"]
+        if ($t -eq "mouse-move") {
+            [NativeInput]::SetCursorPos([int]$cmd["x"], [int]$cmd["y"])
+        } elseif ($t -eq "mouse-down") {
+            [NativeInput]::SetCursorPos([int]$cmd["x"], [int]$cmd["y"])
+            $flag = if ($cmd["button"] -eq "right") { 0x0008 } else { 0x0002 }
+            [NativeInput]::mouse_event($flag, 0, 0, 0, [IntPtr]::Zero)
+        } elseif ($t -eq "mouse-up") {
+            $flag = if ($cmd["button"] -eq "right") { 0x0010 } else { 0x0004 }
+            [NativeInput]::mouse_event($flag, 0, 0, 0, [IntPtr]::Zero)
+        } elseif ($t -eq "mouse-scroll") {
+            [NativeInput]::mouse_event(0x0800, 0, 0, [int]$cmd["deltaY"], [IntPtr]::Zero)
+        } elseif ($t -eq "key-down") {
+            [NativeInput]::keybd_event([byte]$cmd["vk"], 0, 0x0000, [IntPtr]::Zero)
+        } elseif ($t -eq "key-up") {
+            [NativeInput]::keybd_event([byte]$cmd["vk"], 0, 0x0002, [IntPtr]::Zero)
+        }
+    } catch {}
+}
+`
+
+    this.subprocess = spawn('powershell', ['-NoProfile', '-NoLogo', '-Command', '-'], {
+      stdio: ['pipe', 'pipe', 'ignore'],
+    })
+
+    // Feed the script through stdin, then keep stdin open for commands
+    this.subprocess.stdout?.once('data', () => {
+      this.ready = true
+    })
+
+    this.subprocess.stdin?.write(script + '\n')
+
+    this.subprocess.on('exit', () => {
+      this.subprocess = null
+      this.ready = false
+      if (this.enabled) {
+        setTimeout(() => this.ensureSubprocess(), 100)
+      }
+    })
+  }
+
+  private sendWindowsCommand(event: InputEventData, width: number, height: number): void {
+    this.ensureSubprocess()
+    if (!this.subprocess?.stdin?.writable) return
+
+    let cmd: Record<string, any> | null = null
+
     switch (event.type) {
       case 'mouse-move': {
         if (event.x != null && event.y != null) {
-          const x = Math.round(event.x * width)
-          const y = Math.round(event.y * height)
-          this.runPowerShell(`[System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(${x}, ${y})`)
+          cmd = {
+            type: 'mouse-move',
+            x: Math.round(event.x * width),
+            y: Math.round(event.y * height),
+          }
         }
         break
       }
       case 'mouse-down': {
         if (event.x != null && event.y != null) {
-          const x = Math.round(event.x * width)
-          const y = Math.round(event.y * height)
-          const flag = event.button === 'right' ? '0x0008' : '0x0002'
-          this.runPowerShell(`
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public class MouseInput {
-    [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
-    [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, int dx, int dy, int dwData, IntPtr dwExtraInfo);
-}
-"@
-[MouseInput]::SetCursorPos(${x}, ${y})
-[MouseInput]::mouse_event(${flag}, 0, 0, 0, [IntPtr]::Zero)
-`)
+          cmd = {
+            type: 'mouse-down',
+            x: Math.round(event.x * width),
+            y: Math.round(event.y * height),
+            button: event.button || 'left',
+          }
         }
         break
       }
       case 'mouse-up': {
-        const flag = event.button === 'right' ? '0x0010' : '0x0004'
-        this.runPowerShell(`
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public class MouseInput2 {
-    [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, int dx, int dy, int dwData, IntPtr dwExtraInfo);
-}
-"@
-[MouseInput2]::mouse_event(${flag}, 0, 0, 0, [IntPtr]::Zero)
-`)
+        if (event.x != null && event.y != null) {
+          cmd = {
+            type: 'mouse-up',
+            x: Math.round(event.x * width),
+            y: Math.round(event.y * height),
+            button: event.button || 'left',
+          }
+        }
         break
       }
       case 'mouse-scroll': {
         if (event.deltaY != null) {
-          const delta = Math.round(-event.deltaY)
-          this.runPowerShell(`
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public class ScrollInput {
-    [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, int dx, int dy, int dwData, IntPtr dwExtraInfo);
-}
-"@
-[ScrollInput]::mouse_event(0x0800, 0, 0, ${delta}, [IntPtr]::Zero)
-`)
+          cmd = {
+            type: 'mouse-scroll',
+            deltaY: Math.round(-event.deltaY),
+          }
         }
         break
       }
@@ -180,44 +326,37 @@ public class ScrollInput {
         if (event.code) {
           const vk = this.windowsVK(event.code)
           if (vk) {
-            const flag = event.type === 'key-up' ? '0x0002' : '0x0000'
-            this.runPowerShell(`
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public class KeyInput {
-    [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, IntPtr dwExtraInfo);
-}
-"@
-[KeyInput]::keybd_event(${vk}, 0, ${flag}, [IntPtr]::Zero)
-`)
+            cmd = {
+              type: event.type,
+              vk: parseInt(vk, 16),
+            }
           }
         }
         break
       }
     }
+
+    if (cmd) {
+      // Send as JSON line to the running PowerShell stdin
+      // The PowerShell script's while loop will pick it up
+      // But we need to feed it as a variable assignment + processing
+      // Actually the PowerShell approach above reads from Console.In in a loop
+      // We need to write the JSON line to stdin
+      this.subprocess.stdin!.write(JSON.stringify(cmd) + '\n')
+    }
   }
 
-  private runAppleScript(script: string): void {
-    execFile('osascript', ['-e', script.trim()], { timeout: 500 }, () => {})
-  }
+  // ── Key code mappings ──────────────────────────────────────────
 
-  private runPython(script: string): void {
-    execFile('python3', ['-c', script.trim()], { timeout: 500 }, () => {})
-  }
-
-  private runPowerShell(script: string): void {
-    execFile('powershell', ['-NoProfile', '-Command', script.trim()], { timeout: 1000 }, () => {})
-  }
-
-  private macModifierFlags(mods?: InputEventData['modifiers']): string {
-    if (!mods) return ''
-    const flags: string[] = []
-    if (mods.shift) flags.push('Quartz.kCGEventFlagMaskShift')
-    if (mods.ctrl) flags.push('Quartz.kCGEventFlagMaskControl')
-    if (mods.alt) flags.push('Quartz.kCGEventFlagMaskAlternate')
-    if (mods.meta) flags.push('Quartz.kCGEventFlagMaskCommand')
-    return flags.length > 0 ? flags.join(' | ') : ''
+  private macModifierFlagValue(mods?: InputEventData['modifiers']): number {
+    if (!mods) return 0
+    let flags = 0
+    // Quartz modifier flag values
+    if (mods.shift) flags |= 0x20000   // kCGEventFlagMaskShift
+    if (mods.ctrl) flags |= 0x40000    // kCGEventFlagMaskControl
+    if (mods.alt) flags |= 0x80000     // kCGEventFlagMaskAlternate
+    if (mods.meta) flags |= 0x100000   // kCGEventFlagMaskCommand
+    return flags
   }
 
   private macKeyCode(code: string): number {
