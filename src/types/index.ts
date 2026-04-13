@@ -1,4 +1,4 @@
-export type ViewState = 'home' | 'host' | 'join' | 'session'
+export type ViewState = 'home' | 'host' | 'join' | 'session' | 'network-test'
 
 export type SessionRole = 'host' | 'client'
 
@@ -50,6 +50,8 @@ export interface QuickSwapAPI {
   onPeerDisconnected: (callback: () => void) => void
   onSignalingMessage: (callback: (event: any, msg: any) => void) => void
   onControlRequest: (callback: () => void) => void
+  enableInput: () => void
+  disableInput: () => void
   removeAllListeners: (channel: string) => void
   getPlatform: () => string
 }

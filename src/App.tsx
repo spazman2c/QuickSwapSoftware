@@ -5,6 +5,7 @@ import HostView from './components/HostView'
 import JoinView from './components/JoinView'
 import SessionView from './components/SessionView'
 import TitleBar from './components/TitleBar'
+import NetworkTest from './components/NetworkTest'
 
 export default function App() {
   const [view, setView] = useState<ViewState>('home')
@@ -18,6 +19,7 @@ export default function App() {
   const dataChannelRef = useRef<RTCDataChannel | null>(null)
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null)
   const [isControlling, setIsControlling] = useState(false)
+  const swappingRef = useRef(false)
 
   useEffect(() => {
     window.quickswap.onPeerConnected((_event: any, data: any) => {
@@ -45,6 +47,16 @@ export default function App() {
   }, [role])
 
   const createPeerConnection = useCallback(() => {
+    // Clean up old connection if it exists
+    if (pcRef.current) {
+      pcRef.current.onicecandidate = null
+      pcRef.current.ontrack = null
+      pcRef.current.ondatachannel = null
+      pcRef.current.onconnectionstatechange = null
+      pcRef.current.close()
+      pcRef.current = null
+    }
+
     const pc = new RTCPeerConnection({
       iceServers: [],
     })
@@ -72,7 +84,9 @@ export default function App() {
 
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
-        handleDisconnect()
+        if (!swappingRef.current) {
+          handleDisconnect()
+        }
       }
     }
 
@@ -87,10 +101,6 @@ export default function App() {
         const msg = JSON.parse(event.data)
         if (msg.type === 'input-event') {
           window.quickswap.simulateInput(msg.payload)
-        } else if (msg.type === 'swap-request') {
-          handleSwapRequest()
-        } else if (msg.type === 'swap-accept') {
-          handleSwapAccepted()
         } else if (msg.type === 'control-request') {
           window.quickswap.enableInput()
           setIsControlling(false)
@@ -113,6 +123,12 @@ export default function App() {
         audio: false,
       })
 
+      // Hint the track for fluid motion so the encoder prioritizes framerate
+      const videoTrack = stream.getVideoTracks()[0]
+      if (videoTrack) {
+        videoTrack.contentHint = 'motion'
+      }
+
       localStreamRef.current = stream
 
       const pc = createPeerConnection()
@@ -127,7 +143,28 @@ export default function App() {
       })
       setupDataChannel(dc)
 
-      // Configure encoding for high framerate/bitrate on LAN
+      // Prefer H.264 for hardware-accelerated encoding (much better FPS)
+      const transceivers = pc.getTransceivers()
+      const videoTransceiver = transceivers.find(
+        (t) => t.sender.track?.kind === 'video'
+      )
+      if (videoTransceiver) {
+        const codecs = RTCRtpReceiver.getCapabilities('video')?.codecs || []
+        const h264Codecs = codecs.filter(
+          (c) => c.mimeType === 'video/H264'
+        )
+        const otherCodecs = codecs.filter(
+          (c) => c.mimeType !== 'video/H264'
+        )
+        if (h264Codecs.length > 0) {
+          videoTransceiver.setCodecPreferences([...h264Codecs, ...otherCodecs])
+        }
+      }
+
+      const offer = await pc.createOffer()
+      await pc.setLocalDescription(offer)
+
+      // Set encoding params after creating the offer so they stick
       const sender = pc.getSenders().find((s) => s.track?.kind === 'video')
       if (sender) {
         const params = sender.getParameters()
@@ -136,11 +173,10 @@ export default function App() {
         }
         params.encodings[0].maxFramerate = 60
         params.encodings[0].maxBitrate = 50_000_000
+        // Disable bandwidth probing delays — we're on LAN
+        params.degradationPreference = 'maintain-framerate'
         await sender.setParameters(params)
       }
-
-      const offer = await pc.createOffer()
-      await pc.setLocalDescription(offer)
 
       window.quickswap.sendSignalingMessage({
         type: 'offer',
@@ -154,6 +190,16 @@ export default function App() {
   const handleSignalingMessage = useCallback(
     async (msg: any) => {
       if (msg.type === 'offer') {
+        // Close any existing connection cleanly before accepting new offer
+        if (pcRef.current) {
+          pcRef.current.onicecandidate = null
+          pcRef.current.ontrack = null
+          pcRef.current.ondatachannel = null
+          pcRef.current.onconnectionstatechange = null
+          pcRef.current.close()
+          pcRef.current = null
+        }
+
         const pc = createPeerConnection()
 
         await pc.setRemoteDescription(new RTCSessionDescription(msg.data))
@@ -173,36 +219,73 @@ export default function App() {
         await pcRef.current?.addIceCandidate(
           new RTCIceCandidate(msg.data)
         )
+      } else if (msg.type === 'control' && msg.data?.action === 'swap-request') {
+        handleSwapRequest()
+      } else if (msg.type === 'control' && msg.data?.action === 'swap-accept') {
+        handleSwapAccepted()
       }
     },
     [createPeerConnection]
   )
 
   const handleSwapRequest = useCallback(async () => {
-    // Auto-accept swap for now
-    dataChannelRef.current?.send(JSON.stringify({ type: 'swap-accept' }))
+    // Accept the swap — tell the other side via signaling (not data channel)
+    window.quickswap.sendSignalingMessage({
+      type: 'control',
+      data: { action: 'swap-accept' },
+    })
 
-    // Stop current sharing if we are
+    swappingRef.current = true
+
+    // Stop current sharing
     localStreamRef.current?.getTracks().forEach((t) => t.stop())
     localStreamRef.current = null
+    remoteStreamRef.current = null
+    setRemoteStream(null)
+    dataChannelRef.current = null
+    setIsControlling(false)
+    window.quickswap.disableInput()
 
-    // Now we become the viewer — wait for the other side to send a new offer
+    // Close old PC — the other side will create a new one and send an offer
+    if (pcRef.current) {
+      pcRef.current.onconnectionstatechange = null
+      pcRef.current.close()
+      pcRef.current = null
+    }
+
+    swappingRef.current = false
+    // Now wait for the new offer to arrive via signaling
   }, [])
 
   const handleSwapAccepted = useCallback(async () => {
-    // Stop viewing, start sharing
+    swappingRef.current = true
+
+    // Stop viewing
     remoteStreamRef.current = null
     setRemoteStream(null)
+    dataChannelRef.current = null
+    setIsControlling(false)
+    window.quickswap.disableInput()
 
-    // Close old PC and create new one
-    pcRef.current?.close()
-    pcRef.current = null
+    // Close old PC cleanly
+    if (pcRef.current) {
+      pcRef.current.onconnectionstatechange = null
+      pcRef.current.close()
+      pcRef.current = null
+    }
 
+    swappingRef.current = false
+
+    // Now start sharing our screen — creates new PC + offer
     await startScreenShare()
   }, [startScreenShare])
 
   const requestSwap = useCallback(() => {
-    dataChannelRef.current?.send(JSON.stringify({ type: 'swap-request' }))
+    // Send swap request via signaling server (survives PC teardown)
+    window.quickswap.sendSignalingMessage({
+      type: 'control',
+      data: { action: 'swap-request' },
+    })
   }, [])
 
   const requestControl = useCallback(() => {
@@ -212,7 +295,10 @@ export default function App() {
   const handleDisconnect = useCallback(() => {
     localStreamRef.current?.getTracks().forEach((t) => t.stop())
     remoteStreamRef.current = null
-    pcRef.current?.close()
+    if (pcRef.current) {
+      pcRef.current.onconnectionstatechange = null
+      pcRef.current.close()
+    }
     dataChannelRef.current = null
     localStreamRef.current = null
     pcRef.current = null
@@ -265,7 +351,10 @@ export default function App() {
 
       <div className="flex-1 flex flex-col">
         {view === 'home' && (
-          <HomeScreen onHost={handleHost} onJoin={handleJoin} />
+          <HomeScreen onHost={handleHost} onJoin={handleJoin} onNetworkTest={() => setView('network-test')} />
+        )}
+        {view === 'network-test' && (
+          <NetworkTest onBack={() => setView('home')} />
         )}
         {view === 'host' && (
           <HostView

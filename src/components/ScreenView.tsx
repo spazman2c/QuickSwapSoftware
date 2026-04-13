@@ -172,6 +172,8 @@ export default function ScreenView({ stream, isControlling, onInputEvent }: Scre
         playsInline
         muted
         className="w-full h-full object-contain"
+        style={{ willChange: 'contents' }}
+        disablePictureInPicture
       />
 
       {/* Control mode indicator */}

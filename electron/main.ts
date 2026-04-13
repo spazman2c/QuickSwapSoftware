@@ -13,6 +13,12 @@ import { SignalingServer, SignalingClient } from './signaling'
 import { InputController } from './input-controller'
 import { generateCode, SignalingMessage } from './protocol'
 
+// Enable hardware-accelerated video encode/decode
+app.commandLine.appendSwitch('enable-features', 'VaapiVideoDecoder,VaapiVideoEncoder,WebRTCPipeWireCapturer')
+app.commandLine.appendSwitch('enable-gpu-rasterization')
+app.commandLine.appendSwitch('disable-frame-rate-limit')
+app.commandLine.appendSwitch('disable-gpu-vsync')
+
 let mainWindow: BrowserWindow | null = null
 let discovery: Discovery | null = null
 let signalingServer: SignalingServer | null = null
@@ -49,12 +55,18 @@ function createWindow(): void {
 
   // Auto-grant screen capture without system picker
   session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
-    desktopCapturer.getSources({ types: ['screen'] }).then((sources) => {
+    desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width: 0, height: 0 },
+    }).then((sources) => {
       if (sources.length > 0) {
         callback({ video: sources[0] })
       }
     })
   })
+
+  // Disable frame rate limiting for smooth capture
+  mainWindow.webContents.setBackgroundThrottling(false)
 
   if (VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(VITE_DEV_SERVER_URL)

@@ -3,9 +3,10 @@ import GlassPanel from './GlassPanel'
 interface HomeScreenProps {
   onHost: () => void
   onJoin: () => void
+  onNetworkTest: () => void
 }
 
-export default function HomeScreen({ onHost, onJoin }: HomeScreenProps) {
+export default function HomeScreen({ onHost, onJoin, onNetworkTest }: HomeScreenProps) {
   return (
     <div className="flex-1 flex flex-col items-center justify-center px-8 pb-8 animate-fade-in">
       {/* Logo */}
@@ -93,6 +94,28 @@ export default function HomeScreen({ onHost, onJoin }: HomeScreenProps) {
             </div>
           </div>
         </GlassPanel>
+      </div>
+
+      {/* Network Test */}
+      <div className="w-full max-w-xs mt-4">
+        <button
+          onClick={onNetworkTest}
+          className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl bg-transparent hover:bg-surface-raised/60 border border-white/[0.06] text-text-secondary hover:text-text-primary text-sm transition-all"
+        >
+          <svg
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+          </svg>
+          Network Test
+        </button>
       </div>
 
       {/* Version */}

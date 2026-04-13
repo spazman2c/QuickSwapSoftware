@@ -7,7 +7,7 @@ export interface DiscoveryAnnounce {
 }
 
 export interface SignalingMessage {
-  type: 'offer' | 'answer' | 'ice-candidate' | 'control'
+  type: 'offer' | 'answer' | 'ice-candidate' | 'control' | string
   data: any
 }
 
